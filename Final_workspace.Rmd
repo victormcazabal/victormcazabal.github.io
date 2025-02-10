@@ -1,0 +1,204 @@
+---
+title: "Final_GLM"
+author: "Victor Cazabal"
+date: "2024-12-06"
+output: pdf_document
+---
+
+```{r}
+library(tidycensus)
+library(dplyr)
+
+#creating dataset using the following PUMS variables
+pums_vars <- c("HHT", "NP", "POVPIP", "SCHL", "RAC1P", "PUMA", "RELSHIPP", "GRPIP", "HICOV", "TEN", "OCPIP")
+
+#accessing data for the entirety of CT
+ct_pums <- get_pums(
+  variables = pums_vars,
+  state = "CT",
+  survey = "acs1",
+  year = 2023 
+)
+
+#filter to householders and create more variables, including "below poverty line" and "single parent status"
+ct_households_2 <- ct_pums %>%
+  filter(RELSHIPP == "20") %>%  # RELP == "00" indicates the householder
+  mutate(
+    below_poverty = if_else(POVPIP < 100, 1, 0),
+    single_parent = if_else(HHT %in% c("2", "3"), 1, 0)
+  )
+
+#creating a weighted random sample based on person-level weights
+desired_sample_size <- 5000
+
+#normalize the weights to create a probability distribution
+ct_households_2 <- ct_households_2 %>%
+  mutate(selection_prob = PWGTP / sum(PWGTP, na.rm = TRUE))
+
+#use sample() to select a weighted random sample
+set.seed(100)
+sample_indices <- sample(
+  x = seq_len(nrow(ct_households_2)),
+  size = desired_sample_size,
+  replace = FALSE,              
+  prob = ct_households_2$selection_prob
+)
+
+ct_sample <- ct_households_2[sample_indices, ]
+
+#replace GRPIP with housing_cost_burden column
+ct_sample <- ct_sample %>%
+  mutate(
+    housing_cost_burden = if_else(GRPIP > 0, GRPIP, OCPIP)  #use GRPIP if non-zero, otherwise use OCPIP
+  )
+
+# Now ct_sample contains:
+# - below_poverty (binary poverty indicator)
+# - NP (household size)
+# - single_parent (binary)
+# - SCHL (education of householder)
+# - RAC1P (race of householder)
+# - HINCP (household income)
+# - housing_cost_burden (% of household income spent on housing costs)
+# - TEN (tenure status)
+# - HICOV (binary insurance indicator)
+```
+
+
+```{r}
+#cleaning dataset
+ct_sample <- ct_sample[, !names(ct_sample) %in% c("SERIALNO", "SPORDER", "WGTP", "PWGTP", "POVPIP", "STATE", "RELSHIPP", "selection_prob", "GRPIP", "OCPIP", "HHT")]
+
+#grouping education levels
+ct_sample <- ct_sample %>%
+  mutate(
+    SCHL_grouped = case_when(
+      SCHL >= 1 & SCHL <= 17 ~ "HS",
+      SCHL %in% c(18, 19, 20)    ~ "SC",
+      SCHL >= 21             ~ "C",
+      TRUE                   ~ NA_character_  # In case something falls outside expected ranges
+    )
+  )
+
+ct_sample <- ct_sample %>%
+  mutate(SCHL_grouped = ifelse(is.na(SCHL_grouped), "HS", SCHL_grouped))
+
+#organizing race of householders
+ct_sample <- ct_sample %>%
+  mutate(
+    RAC1P_grouped = case_when(
+      RAC1P %in% c(3, 4, 5, 7, 8) ~ 7,
+      TRUE ~ as.double(RAC1P)  #keep all other codes as is
+    )
+  )
+
+ct_sample <- ct_sample %>%
+  mutate(
+    RAC1P_grouped = if_else(RAC1P_grouped == 8, 7, RAC1P_grouped)
+  )
+
+
+#making groupings clear
+ct_sample <- ct_sample %>%
+  mutate(
+    RAC1P_grouped = case_when(
+      RAC1P_grouped == 1 ~ "White",
+      RAC1P_grouped == 2 ~ "Black",
+      RAC1P_grouped == 6 ~ "Asian",
+      RAC1P_grouped == 7 ~ "Other",
+      RAC1P_grouped == 9 ~ "Two or more"
+    )
+  )
+
+ct_sample <- ct_sample %>%
+  mutate(
+    TEN = case_when(
+      TEN == 1 ~ "Owned/Mortgage",
+      TEN == 2 ~ "Owned/Free",
+      TEN == 3 ~ "Rented",
+      TEN == 4 ~ "Occupied"
+    )
+  )
+```
+
+```{r}
+ct_sample$SCHL <- factor(ct_sample$SCHL)
+ct_sample$RACE <- factor(ct_sample$RACE)
+ct_sample$PUMA <- factor(ct_sample$PUMA)
+ct_sample$HICOV <- factor(ct_sample$HICOV)
+ct_sample$POV <- factor(ct_sample$POV)
+ct_sample$SP <- factor(ct_sample$SP)
+ct_sample$TEN <- factor(ct_sample$TEN)
+
+names(ct_sample)[names(ct_sample) == 'SCHL_grouped'] <- 'SCHL'
+names(ct_sample)[names(ct_sample) == 'RAC1P_grouped'] <- 'RACE'
+names(ct_sample)[names(ct_sample) == 'below_poverty'] <- 'POV'
+names(ct_sample)[names(ct_sample) == 'single_parent'] <- 'SP'
+names(ct_sample)[names(ct_sample) == 'housing_cost_burden'] <- 'HCB'
+
+write.csv(ct_sample, "ct_sample.csv", row.names = FALSE)
+
+
+
+
+
+#modeling a logistic regression to predict whether a household is living below the poverty line or not
+model <- glm(
+  POV ~ NP + TEN + SP + SCHL + RACE + HCB + HICOV,
+  data = ct_sample,
+  family = binomial(link = "logit")
+)
+
+summary(model)
+```
+
+```{r}
+null_model <- glm(POV ~ 1, data = ct_sample, family = binomial(link = "logit"))
+
+#perform a likelihood ratio test comparing the null model to the full model
+anova(null_model, model, test = "Chisq")
+
+model_2 <- glm(
+  POV ~ SP + SCHL + HCB + HICOV + TEN + RACE + TEN*HCB,
+  data = ct_sample,
+  family = binomial(link = "logit")
+)
+
+model_3 <- glm(
+  POV ~ SP + SCHL + HCB + HICOV + RACE + TEN + TEN*HCB + HCB*SCHL,
+  data = ct_sample,
+  family = binomial(link = "logit")
+)
+
+anova(model_2, model_3, test= "Chisq")
+
+summary(model_2)
+```
+
+```{r}
+#for the null model, it will predict the same probability for all:
+null_pred_prob <- predict(null_model, type = "response")
+#since null_model has no predictors, it's basically the overall probability of being below poverty.
+
+#convert to binary by threshold = 0.5:
+null_pred_class <- ifelse(null_pred_prob > 0.5, 1, 0)
+
+#for the full model:
+full_pred_prob <- predict(model_2, type = "response")
+full_pred_class <- ifelse(full_pred_prob > 0.5, 1, 0)
+
+#actual values:
+actual <- ct_sample$POV
+
+#calculate accuracy/error rate for null model
+null_accuracy <- mean(null_pred_class == actual)
+null_error_rate <- 1 - null_accuracy
+
+#calculate accuracy/error rate for full model
+full_accuracy <- mean(full_pred_class == actual)
+full_error_rate <- 1 - full_accuracy
+
+cat("Null Model Error Rate:", null_error_rate, "\n")
+cat("Full Model Error Rate:", full_error_rate, "\n")
+```
+
